@@ -5,7 +5,10 @@
 //! calling the underlying reader, even if that read immediately returns.
 
 use std::io::{self, BufRead, BufReader, BufWriter, IoSlice, IoSliceMut, Read, Write};
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+};
 
 type Output<'a> = Rc<RefCell<dyn Write + 'a>>;
 type Outputs<'a> = Rc<RefCell<Vec<Output<'a>>>>;
@@ -34,7 +37,7 @@ impl<'a> BufferedIoGroup<'a> {
     pub fn reader<R: Read>(&self, reader: R) -> BufReader<FlushingReader<'a, R>> {
         BufReader::new(FlushingReader {
             reader,
-            group: self.clone(),
+            group: Some(self.clone()),
         })
     }
 
@@ -47,13 +50,13 @@ impl<'a> BufferedIoGroup<'a> {
             capacity,
             FlushingReader {
                 reader,
-                group: self.clone(),
+                group: Some(self.clone()),
             },
         )
     }
 
     /// Registers an output, retaining its buffer until the group is released.
-    pub fn writer<W: Write + 'a>(&self, writer: W) -> GroupWriter<W> {
+    pub fn writer<W: Write + 'a>(&self, writer: W) -> GroupWriter<'a, W> {
         self.register(BufWriter::new(writer))
     }
 
@@ -61,14 +64,17 @@ impl<'a> BufferedIoGroup<'a> {
         &self,
         capacity: usize,
         writer: W,
-    ) -> GroupWriter<W> {
+    ) -> GroupWriter<'a, W> {
         self.register(BufWriter::with_capacity(capacity, writer))
     }
 
-    fn register<W: Write + 'a>(&self, writer: BufWriter<W>) -> GroupWriter<W> {
+    fn register<W: Write + 'a>(&self, writer: BufWriter<W>) -> GroupWriter<'a, W> {
         let writer = Rc::new(RefCell::new(writer));
         self.outputs.borrow_mut().push(writer.clone());
-        GroupWriter { writer }
+        GroupWriter {
+            writer,
+            registration: Some(Rc::downgrade(&self.outputs)),
+        }
     }
 
     /// Attempts to flush every output, returning the first error if any fail.
@@ -96,7 +102,18 @@ impl<'a> BufferedIoGroup<'a> {
 /// Wrapping the source ensures all buffer refill and direct-read paths flush.
 pub struct FlushingReader<'a, R> {
     reader: R,
-    group: BufferedIoGroup<'a>,
+    group: Option<BufferedIoGroup<'a>>,
+}
+
+impl<R> FlushingReader<'_, R> {
+    /// Stops flushing the group before source reads.
+    ///
+    /// Call this via `input.get_mut().detach()` to retain the enclosing
+    /// `BufReader` and all unread buffered bytes. Does not perform I/O and
+    /// can be called repeatedly. Other inputs remain attached.
+    pub fn detach(&mut self) {
+        self.group = None;
+    }
 }
 
 impl<R: Read> Read for FlushingReader<'_, R> {
@@ -104,7 +121,9 @@ impl<R: Read> Read for FlushingReader<'_, R> {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.group.flush()?;
+        if let Some(group) = &self.group {
+            group.flush()?;
+        }
         self.reader.read(buf)
     }
 
@@ -112,18 +131,42 @@ impl<R: Read> Read for FlushingReader<'_, R> {
         if bufs.iter().all(|buf| buf.is_empty()) {
             return Ok(0);
         }
-        self.group.flush()?;
+        if let Some(group) = &self.group {
+            group.flush()?;
+        }
         self.reader.read_vectored(bufs)
     }
 }
 
 /// A handle to one buffered output in a group.
 /// Its explicit `flush` flushes only this output; use the group to flush all.
-pub struct GroupWriter<W: Write> {
+pub struct GroupWriter<'a, W: Write> {
     writer: Rc<RefCell<BufWriter<W>>>,
+    registration: Option<Weak<RefCell<Vec<Output<'a>>>>>,
 }
 
-impl<W: Write> Write for GroupWriter<W> {
+impl<'a, W: Write + 'a> GroupWriter<'a, W> {
+    /// Removes this output from the group's automatic and explicit flushes.
+    ///
+    /// Preserves buffered output without flushing it. This handle continues
+    /// to implement `Write`; explicitly flush it to handle final errors.
+    /// The change is visible to all inputs and cloned groups. Repeated calls
+    /// are harmless, including after the group has been dropped.
+    pub fn detach(&mut self) {
+        if let Some(outputs) = self
+            .registration
+            .take()
+            .and_then(|outputs| outputs.upgrade())
+        {
+            let writer: Output<'a> = self.writer.clone();
+            outputs
+                .borrow_mut()
+                .retain(|output| !Rc::ptr_eq(output, &writer));
+        }
+    }
+}
+
+impl<W: Write> Write for GroupWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.writer.borrow_mut().write(buf)
     }
@@ -599,6 +642,110 @@ mod tests {
         assert_eq!(*events.borrow(), vec![Event::Read]);
         events.borrow_mut().clear();
         other.flush()?;
+        assert_eq!(
+            *events.borrow(),
+            vec![Event::Write(b">".to_vec()), Event::Flush]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detached_output_keeps_buffer_and_is_excluded_from_all_group_flushes() -> io::Result<()> {
+        let events = Events::default();
+        let group = BufferedIoGroup::new();
+        let clone = group.clone();
+        let mut input = group.reader(group_reader(&events, b"abc"));
+        let mut detached = group.writer(group_writer(&events, false));
+        let mut attached = group.writer(group_writer(&events, false));
+        detached.write_all(b"1")?;
+        attached.write_all(b"2")?;
+        detached.detach();
+        detached.detach();
+        assert!(events.borrow().is_empty());
+        input.read_exact(&mut [0])?;
+        assert_eq!(
+            *events.borrow(),
+            vec![Event::Write(b"2".to_vec()), Event::Flush, Event::Read]
+        );
+        events.borrow_mut().clear();
+        clone.flush()?;
+        assert_eq!(*events.borrow(), vec![Event::Flush]);
+        events.borrow_mut().clear();
+        detached.write_all(b"3")?;
+        detached.flush()?;
+        assert_eq!(
+            *events.borrow(),
+            vec![Event::Write(b"13".to_vec()), Event::Flush]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detached_input_preserves_unread_bytes_and_does_not_flush_at_refill() -> io::Result<()> {
+        let events = Events::default();
+        let group = BufferedIoGroup::new();
+        let mut input = group.reader_with_capacity(4, group_reader(&events, b"abcdef"));
+        let mut other = group.reader(group_reader(&events, b"xyz"));
+        let mut output = group.writer(group_writer(&events, false));
+        input.read_exact(&mut [0])?;
+        assert_eq!(input.buffer(), b"bcd");
+        events.borrow_mut().clear();
+        output.write_all(b">")?;
+        input.get_mut().detach();
+        input.get_mut().detach();
+        assert_eq!(input.buffer(), b"bcd");
+        assert!(events.borrow().is_empty());
+        let mut rest = [0; 5];
+        input.read_exact(&mut rest)?;
+        assert_eq!(&rest, b"bcdef");
+        assert_eq!(*events.borrow(), vec![Event::Read]);
+        events.borrow_mut().clear();
+        other.read_exact(&mut [0])?;
+        assert_eq!(
+            *events.borrow(),
+            vec![Event::Write(b">".to_vec()), Event::Flush, Event::Read]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_failed_output_allows_input_to_resume() -> io::Result<()> {
+        let events = Events::default();
+        let group = BufferedIoGroup::new();
+        let mut input = group.reader(group_reader(&events, b"abc"));
+        let mut output = group.writer(group_writer(&events, true));
+        assert_eq!(
+            input.fill_buf().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        events.borrow_mut().clear();
+        output.write_all(b">")?;
+        output.detach();
+        assert_eq!(input.fill_buf()?, b"abc");
+        assert_eq!(*events.borrow(), vec![Event::Read]);
+        events.borrow_mut().clear();
+        assert_eq!(
+            output.flush().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            *events.borrow(),
+            vec![Event::Write(b">".to_vec()), Event::Flush]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn output_detaches_after_group_is_dropped() -> io::Result<()> {
+        let events = Events::default();
+        let group = BufferedIoGroup::new();
+        let mut output = group.writer(group_writer(&events, false));
+        output.write_all(b">")?;
+        drop(group);
+        output.detach();
+        output.detach();
+        assert!(events.borrow().is_empty());
+        output.flush()?;
         assert_eq!(
             *events.borrow(),
             vec![Event::Write(b">".to_vec()), Event::Flush]
