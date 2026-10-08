@@ -1,15 +1,20 @@
-use buffered_io::BufferedIo;
+use buffered_io::BufferedIoGroup;
 use std::io::{self, BufRead, Write};
 
 fn main() -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut io = BufferedIo::new(stdin.lock(), stdout.lock());
+    let stderr = io::stderr();
+    let group = BufferedIoGroup::new();
+    let mut input = group.reader(stdin.lock());
+    let mut output = group.writer(stdout.lock());
+    let mut diagnostics = group.writer(stderr.lock());
 
-    write!(io, "名前: ")?;
+    write!(output, "名前: ")?;
+    write!(diagnostics, "名前を入力してください。")?;
     let mut name = String::new();
-    if io.read_line(&mut name)? != 0 {
-        writeln!(io, "こんにちは、{}さん", name.trim_end())?;
+    if input.read_line(&mut name)? != 0 {
+        writeln!(output, "こんにちは、{}さん", name.trim_end())?;
     }
-    io.flush()
+    group.flush()
 }
