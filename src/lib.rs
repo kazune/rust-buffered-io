@@ -4,7 +4,7 @@
 //! Consequently, output is flushed whenever the input buffer is empty, before
 //! calling the underlying reader, even if that read immediately returns.
 
-use std::io::{self, BufRead, BufReader, BufWriter, IoSlice, IoSliceMut, Read, Write};
+use std::io::{self, BufReader, BufWriter, IoSlice, IoSliceMut, Read, Write};
 use std::{
     cell::RefCell,
     rc::{Rc, Weak},
@@ -180,101 +180,14 @@ impl<W: Write> Write for GroupWriter<'_, W> {
     }
 }
 
-/// A coupled `BufReader` and `BufWriter` for interactive I/O.
-///
-/// Reads satisfied by the input buffer leave output buffered. Reads requiring
-/// the underlying source first flush output, propagating any flush error without
-/// reading input. As with `BufWriter`, explicitly call `flush` before dropping
-/// this value if you need to handle errors while flushing the final output.
-pub struct BufferedIo<R, W: Write> {
-    reader: BufReader<R>,
-    writer: BufWriter<W>,
-}
-
-impl<R: Read, W: Write> BufferedIo<R, W> {
-    /// Uses the standard library's default buffer capacities.
-    pub fn new(reader: R, writer: W) -> Self {
-        Self {
-            reader: BufReader::new(reader),
-            writer: BufWriter::new(writer),
-        }
-    }
-
-    /// Sets the input and output buffer capacities independently, in bytes.
-    pub fn with_capacity(
-        read_capacity: usize,
-        write_capacity: usize,
-        reader: R,
-        writer: W,
-    ) -> Self {
-        Self {
-            reader: BufReader::with_capacity(read_capacity, reader),
-            writer: BufWriter::with_capacity(write_capacity, writer),
-        }
-    }
-
-    /// Separates the buffered reader and writer, preserving both buffers.
-    ///
-    /// This does not flush output; automatic flushing before input ends here.
-    pub fn into_parts(self) -> (BufReader<R>, BufWriter<W>) {
-        (self.reader, self.writer)
-    }
-
-    fn flush_before_read(&mut self) -> io::Result<()> {
-        if self.reader.buffer().is_empty() {
-            self.writer.flush()?;
-        }
-        Ok(())
-    }
-}
-
-impl<R: Read, W: Write> Read for BufferedIo<R, W> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        self.flush_before_read()?;
-        self.reader.read(buf)
-    }
-
-    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        if bufs.iter().all(|buf| buf.is_empty()) {
-            return Ok(0);
-        }
-        self.flush_before_read()?;
-        self.reader.read_vectored(bufs)
-    }
-}
-
-impl<R: Read, W: Write> BufRead for BufferedIo<R, W> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.flush_before_read()?;
-        self.reader.fill_buf()
-    }
-
-    fn consume(&mut self, amount: usize) {
-        self.reader.consume(amount);
-    }
-}
-
-impl<R, W: Write> Write for BufferedIo<R, W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write(buf)
-    }
-
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        self.writer.write_vectored(bufs)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, io::Cursor, rc::Rc};
+    use std::{
+        cell::RefCell,
+        io::{BufRead, Cursor},
+        rc::Rc,
+    };
 
     #[derive(Debug, PartialEq)]
     enum Event {
@@ -322,26 +235,24 @@ mod tests {
         }
     }
 
-    fn fixture(data: &[u8], fail_flush: bool) -> (BufferedIo<Reader, Writer>, Events) {
+    type TestInput = BufReader<FlushingReader<'static, Reader>>;
+    type TestOutput = GroupWriter<'static, Writer>;
+
+    fn fixture(data: &[u8], fail_flush: bool) -> (TestInput, TestOutput, Events) {
         let events = Events::default();
-        let reader = Reader {
-            data: Cursor::new(data.to_vec()),
-            events: events.clone(),
-        };
-        let writer = Writer {
-            events: events.clone(),
-            fail_flush,
-        };
-        (BufferedIo::with_capacity(4, 32, reader, writer), events)
+        let group = BufferedIoGroup::new();
+        let input = group.reader_with_capacity(4, group_reader(&events, data));
+        let output = group.writer_with_capacity(32, group_writer(&events, fail_flush));
+        (input, output, events)
     }
 
     #[test]
     fn flushes_all_output_before_source_read() -> io::Result<()> {
-        let (mut io, events) = fixture(b"abcdef", false);
-        io.write_all(b"hello")?;
+        let (mut input, mut output, events) = fixture(b"abcdef", false);
+        output.write_all(b"hello")?;
         assert!(events.borrow().is_empty());
         let mut byte = [0];
-        io.read_exact(&mut byte)?;
+        input.read_exact(&mut byte)?;
         assert_eq!(byte, *b"a");
         assert_eq!(
             *events.borrow(),
@@ -355,12 +266,12 @@ mod tests {
         );
 
         events.borrow_mut().clear();
-        io.write_all(b"next")?;
+        output.write_all(b"next")?;
         let mut buffered = [0; 3];
-        io.read_exact(&mut buffered)?;
+        input.read_exact(&mut buffered)?;
         assert_eq!(&buffered, b"bcd");
         assert!(events.borrow().is_empty());
-        io.read_exact(&mut byte)?;
+        input.read_exact(&mut byte)?;
         assert_eq!(byte, *b"e");
         assert_eq!(
             *events.borrow(),
@@ -376,10 +287,10 @@ mod tests {
 
     #[test]
     fn line_reads_flush_at_each_refill() -> io::Result<()> {
-        let (mut io, events) = fixture(b"abcde\n", false);
-        io.write_all(b">")?;
+        let (mut input, mut output, events) = fixture(b"abcde\n", false);
+        output.write_all(b">")?;
         let mut line = String::new();
-        assert_eq!(io.read_line(&mut line)?, 6);
+        assert_eq!(input.read_line(&mut line)?, 6);
         assert_eq!(line, "abcde\n");
         assert_eq!(
             *events.borrow(),
@@ -397,13 +308,13 @@ mod tests {
     #[test]
     fn large_and_vectored_reads_flush_before_bypassing_buffer() -> io::Result<()> {
         for vectored in [false, true] {
-            let (mut io, events) = fixture(b"abcdef", false);
-            io.write_all(b">")?;
+            let (mut input, mut output, events) = fixture(b"abcdef", false);
+            output.write_all(b">")?;
             let mut buf = [0; 8];
             let n = if vectored {
-                io.read_vectored(&mut [IoSliceMut::new(&mut buf)])?
+                input.read_vectored(&mut [IoSliceMut::new(&mut buf)])?
             } else {
-                io.read(&mut buf)?
+                input.read(&mut buf)?
             };
             assert_eq!(&buf[..n], b"abcdef");
             assert_eq!(
@@ -417,15 +328,15 @@ mod tests {
     #[test]
     fn flush_error_prevents_source_read() -> io::Result<()> {
         for operation in 0..3 {
-            let (mut io, events) = fixture(b"abc", true);
-            io.write_all(b">")?;
+            let (mut input, mut output, events) = fixture(b"abc", true);
+            output.write_all(b">")?;
             let mut buf = [0; 8];
             let error = match operation {
-                0 => io.read(&mut buf).unwrap_err(),
-                1 => io
+                0 => input.read(&mut buf).unwrap_err(),
+                1 => input
                     .read_vectored(&mut [IoSliceMut::new(&mut buf)])
                     .unwrap_err(),
-                _ => io.fill_buf().unwrap_err(),
+                _ => input.fill_buf().unwrap_err(),
             };
             assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
             assert_eq!(
@@ -437,28 +348,33 @@ mod tests {
     }
 
     #[test]
-    fn empty_reads_do_not_flush_or_read() -> io::Result<()> {
-        let (mut io, events) = fixture(b"abc", true);
-        io.write_all(b">")?;
-        assert_eq!(io.read(&mut [])?, 0);
-        assert_eq!(io.read_vectored(&mut [])?, 0);
-        assert_eq!(io.read_vectored(&mut [IoSliceMut::new(&mut [])])?, 0);
+    fn source_adapter_empty_reads_do_not_flush_or_read() -> io::Result<()> {
+        let (mut input, mut output, events) = fixture(b"abc", true);
+        output.write_all(b">")?;
+        assert_eq!(input.get_mut().read(&mut [])?, 0);
+        assert_eq!(input.get_mut().read_vectored(&mut [])?, 0);
+        assert_eq!(
+            input
+                .get_mut()
+                .read_vectored(&mut [IoSliceMut::new(&mut [])])?,
+            0
+        );
         assert!(events.borrow().is_empty());
         Ok(())
     }
 
     #[test]
     fn eof_and_explicit_flush_work() -> io::Result<()> {
-        let (mut io, events) = fixture(b"", false);
-        io.write_all(b">")?;
-        assert_eq!(io.read(&mut [0])?, 0);
+        let (mut input, mut output, events) = fixture(b"", false);
+        output.write_all(b">")?;
+        assert_eq!(input.read(&mut [0])?, 0);
         assert_eq!(
             *events.borrow(),
             vec![Event::Write(b">".to_vec()), Event::Flush, Event::Read]
         );
         events.borrow_mut().clear();
-        io.write_all(b"!")?;
-        io.flush()?;
+        output.write_all(b"!")?;
+        output.flush()?;
         assert_eq!(
             *events.borrow(),
             vec![Event::Write(b"!".to_vec()), Event::Flush]
