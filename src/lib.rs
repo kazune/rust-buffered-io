@@ -140,6 +140,7 @@ impl<R: Read> Read for FlushingReader<'_, R> {
 
 /// A handle to one buffered output in a group.
 /// Its explicit `flush` flushes only this output; use the group to flush all.
+/// Reentrant writes and flushes return an I/O error if the output is in use.
 pub struct GroupWriter<'a, W: Write> {
     writer: Rc<RefCell<BufWriter<W>>>,
     registration: Option<Weak<RefCell<Vec<Output<'a>>>>>,
@@ -168,15 +169,24 @@ impl<'a, W: Write + 'a> GroupWriter<'a, W> {
 
 impl<W: Write> Write for GroupWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.borrow_mut().write(buf)
+        self.writer
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("output is already in use"))?
+            .write(buf)
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        self.writer.borrow_mut().write_vectored(bufs)
+        self.writer
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("output is already in use"))?
+            .write_vectored(bufs)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.borrow_mut().flush()
+        self.writer
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("output is already in use"))?
+            .flush()
     }
 }
 
@@ -394,6 +404,69 @@ mod tests {
             events: events.clone(),
             fail_flush,
         }
+    }
+
+    #[test]
+    fn reentrant_output_operations_return_errors() -> io::Result<()> {
+        struct ReentrantWriter {
+            callback: Box<dyn FnMut()>,
+            reenter_on_write: bool,
+        }
+
+        impl Write for ReentrantWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.reenter_on_write {
+                    (self.callback)();
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                if !self.reenter_on_write {
+                    (self.callback)();
+                }
+                Ok(())
+            }
+        }
+
+        for reenter_on_write in [false, true] {
+            let group = BufferedIoGroup::new();
+            let handle = Rc::new(RefCell::new(None::<GroupWriter<'_, ReentrantWriter>>));
+            let weak_handle = Rc::downgrade(&handle);
+            let calls = Rc::new(RefCell::new(0));
+            let callback_calls = calls.clone();
+            let writer = ReentrantWriter {
+                callback: Box::new(move || {
+                    let handle = weak_handle.upgrade().unwrap();
+                    let mut handle = handle.borrow_mut();
+                    let output = handle.as_mut().unwrap();
+                    let errors = [
+                        output.write(b"nested").unwrap_err(),
+                        output
+                            .write_vectored(&[IoSlice::new(b"nested")])
+                            .unwrap_err(),
+                        output.flush().unwrap_err(),
+                    ];
+                    for error in errors {
+                        assert_eq!(error.kind(), io::ErrorKind::Other);
+                        assert_eq!(error.to_string(), "output is already in use");
+                    }
+                    *callback_calls.borrow_mut() += 1;
+                }),
+                reenter_on_write,
+            };
+            let mut output = group.writer(writer);
+            output.write_all(b"buffered")?;
+            *handle.borrow_mut() = Some(output);
+
+            // The group holds the buffer's borrow while the underlying writer
+            // reenters through its otherwise available public handle.
+            group.flush()?;
+            assert_eq!(*calls.borrow(), 1);
+            group.flush()?;
+            assert_eq!(*calls.borrow(), if reenter_on_write { 1 } else { 2 });
+        }
+        Ok(())
     }
 
     #[test]
